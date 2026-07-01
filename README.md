@@ -244,8 +244,8 @@ Each generated **Citation Verification Report** is a self-contained PDF:
 
 <table>
 <tr>
-<td width="50%"><img src="assets/report_page1.png" alt="ClaimRef report — cover & statistics" /></td>
-<td width="50%"><img src="assets/report_page2.png" alt="ClaimRef report — per-citation breakdown" /></td>
+<td width="50%"><img src="images/1.png" alt="ClaimRef report — cover & statistics" /></td>
+<td width="50%"><img src="images/2.png" alt="ClaimRef report — per-citation breakdown" /></td>
 </tr>
 <tr>
 <td align="center"><b>Cover + Statistics</b></td>
