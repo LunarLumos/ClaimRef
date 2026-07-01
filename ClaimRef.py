@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, re, logging, getpass
+import argparse, os, re, json, logging, getpass
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +26,36 @@ TOOL_NAME = "ClaimRef"
 TOOL_TAGLINE = "Citation Verification Report"
 DEVELOPER = "Aifee Aadil"
 GITHUB_URL = "https://github.com/LunarLumos"
+
+
+def _load_api_config() -> dict:
+    path = Path(__file__).resolve().parent / "api.yml"
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml
+        return yaml.safe_load(text) or {}
+    except ImportError:
+        # Minimal fallback parser for simple "key: value" YAML.
+        cfg = {}
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+        return cfg
+
+_API_CFG = _load_api_config()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", _API_CFG.get("gemini_api_key", ""))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", _API_CFG.get("gemini_model", "gemini-2.5-flash"))
+
+VERDICT_COLORS = {
+    "Supported": "#1a7f37",
+    "Unsupported": "#b00020",
+    "Uncertain": "#b06f00",
+}
 
 PRIMARY_COLOR = colors.HexColor("#1a3c6e")
 ACCENT_COLOR = colors.HexColor("#4a86e8")
@@ -405,11 +435,16 @@ def split_pdf_references(text: str):
             refs[mm.group(1)] = entry
     return body, refs
 
-def extract_pdf_citations(text: str, page_spans) -> List[dict]:
+def extract_pdf_citations(text: str, page_spans, valid_keys=None) -> List[dict]:
     cites = []
     for m in _PDF_CITE_RE.finditer(text):
         keys = _expand_ref_range(m.group(1))
         if not keys:
+            continue
+        # Reject brackets that aren't real citations, e.g. the interval "[0,1]".
+        # Bibliographies are numbered 1..N, so any key outside that set (0 or
+        # out-of-range) means the whole bracket is math/notation, not a citation.
+        if valid_keys and not all(k in valid_keys for k in keys):
             continue
         cites.append({
             "keys": keys,
@@ -583,7 +618,7 @@ def process_pdf(path: Path):
     logger.info("Locating reference list…")
     body, num_bib = split_pdf_references(text)
 
-    num_cites = extract_pdf_citations(body, page_spans)
+    num_cites = extract_pdf_citations(body, page_spans, valid_keys=set(num_bib))
     if num_cites and num_bib:
         style = "numeric"
         bib, citations = num_bib, num_cites
@@ -613,6 +648,72 @@ def process_pdf(path: Path):
     meta = {"word_count": words, "char_count": chars, "pages": n_pages}
     logger.info(f"Word count: {words:,} · Character count: {chars:,}")
     return records, bib, meta
+
+def verify_claims(records: List[dict], bib: Dict[str, str]) -> None:
+    """Ask Gemini whether each cited reference supports its claim.
+
+    Mutates each record in place, adding rec['verify'] = {verdict, reason}.
+    """
+    if not records:
+        return
+    try:
+        import requests
+    except ImportError:
+        logger.error("--verify requires the 'requests' package – run: pip install requests")
+        return
+    if not GEMINI_API_KEY:
+        logger.error("--verify needs an API key. Set the GEMINI_API_KEY environment variable.")
+        return
+
+    blocks = []
+    for rec in records:
+        refs = " | ".join(bib.get(k, f"[missing key: {k}]") for k in rec["keys"])
+        blocks.append(f'[{rec["index"]}] Claim: {rec["claim"]}\n    Reference: {refs}')
+    prompt = (
+        "You are a citation verification assistant. For each numbered item you are "
+        "given a claim from a paper and the bibliographic reference it cites. Using the "
+        "reference's topic and your knowledge of that work, judge whether the reference "
+        "plausibly supports the claim.\n\n"
+        "Return ONLY a JSON array. Each element must be "
+        '{"index": <int>, "verdict": "Supported" | "Unsupported" | "Uncertain", '
+        '"reason": "<at most 15 words>"}.\n\n'
+        "Items:\n" + "\n\n".join(blocks)
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+    }
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+
+    logger.info(f"Verifying {len(records)} citation(s) with {GEMINI_MODEL}…")
+    try:
+        resp = requests.post(url, headers={"Content-Type": "application/json"},
+                             data=json.dumps(payload), timeout=120)
+        resp.raise_for_status()
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        verdicts = json.loads(text)
+    except Exception as exc:
+        logger.error(f"Citation verification failed: {exc}")
+        return
+
+    by_index = {}
+    for v in verdicts:
+        try:
+            by_index[int(v["index"])] = v
+        except (KeyError, ValueError, TypeError):
+            continue
+    n_ok = 0
+    for rec in records:
+        v = by_index.get(rec["index"])
+        if not v:
+            continue
+        verdict = str(v.get("verdict", "Uncertain")).strip().title()
+        if verdict not in VERDICT_COLORS:
+            verdict = "Uncertain"
+        rec["verify"] = {"verdict": verdict, "reason": str(v.get("reason", "")).strip()}
+        n_ok += 1
+    logger.info(f"Received verdicts for {n_ok}/{len(records)} citation(s).")
 
 def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dict = None):
     checker = get_checker()
@@ -722,6 +823,8 @@ def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dic
     uncited = [k for k in bib if k not in unique_keys]
     word_count = meta.get("word_count", 0)
     char_count = meta.get("char_count", 0)
+    verdict_counts = Counter(rec["verify"]["verdict"]
+                             for rec in records if rec.get("verify"))
 
     stats_data = [
         ["Total citations (cite commands)", str(len(records))],
@@ -730,6 +833,15 @@ def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dic
         ["Missing bibliography entries", str(missing)],
         ["Uncited references", str(len(uncited))],
         ["Number of claims extracted", str(len(records))],
+    ]
+    if verdict_counts:
+        stats_data += [
+            ["Citations verified (AI)", str(sum(verdict_counts.values()))],
+            ["  · Supported", str(verdict_counts.get("Supported", 0))],
+            ["  · Unsupported", str(verdict_counts.get("Unsupported", 0))],
+            ["  · Uncertain", str(verdict_counts.get("Uncertain", 0))],
+        ]
+    stats_data += [
         ["Total word count", f"{word_count:,}"],
         ["Total character count", f"{char_count:,}"],
         ["Report generated", generated],
@@ -770,6 +882,14 @@ def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dic
         for key in keys:
             ref = bib.get(key, f"WARNING: Citation key '{key}' not found in bibliography.")
             story.append(Paragraph(ref, styles["RefText"]))
+        if rec.get("verify"):
+            v = rec["verify"]
+            color = VERDICT_COLORS.get(v["verdict"], "#555555")
+            story.append(Paragraph("Verification", styles["Heading3Color"]))
+            verdict_html = f'<font color="{color}"><b>{v["verdict"]}</b></font>'
+            if v.get("reason"):
+                verdict_html += f' &mdash; {v["reason"]}'
+            story.append(Paragraph(verdict_html, styles["ClaimBox"]))
         story.append(HRFlowable(width="100%", thickness=0.5, color=colors.Color(0.8, 0.8, 0.8)))
         story.append(Spacer(1, 0.2 * inch))
 
@@ -868,6 +988,9 @@ def main():
                     "or PDF paper and produce a Citation Verification Report.")
     parser.add_argument("source", help="Path to the paper: .tex (LaTeX) or .pdf")
     parser.add_argument("-o", "--output", default="claims_report.pdf", help="Output PDF filename")
+    parser.add_argument("--verify", action="store_true",
+                        help="Use Gemini to check whether each citation supports its claim "
+                             "(needs the 'requests' package and a GEMINI_API_KEY).")
     args = parser.parse_args()
 
     src = Path(args.source).resolve()
@@ -882,6 +1005,9 @@ def main():
 
     if not records:
         logger.warning("No citations found – the report will be empty.")
+
+    if args.verify:
+        verify_claims(records, bib)
 
     logger.info("Building PDF…")
     build_pdf(records, bib, Path(args.output), meta)
