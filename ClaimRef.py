@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse, re, logging, getpass
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -124,8 +125,21 @@ def remove_environments(tex: str, envs: List[str]) -> str:
                      "", tex, flags=re.DOTALL | re.IGNORECASE)
     return tex
 
+_ESC_PLACEHOLDERS = [
+    (r"\$", "\x01"), (r"\%", "\x02"), (r"\&", "\x03"),
+    (r"\_", "\x04"), (r"\#", "\x05"),
+]
+
 def clean_tex_for_sentence(tex: str) -> str:
     tex = remove_comments(tex)
+    # Keep only the document body; drop the preamble (\documentclass, \usepackage…).
+    m = re.search(r"\\begin\{document\}(.*)\\end\{document\}", tex, re.DOTALL)
+    if m:
+        tex = m.group(1)
+    # Protect escaped specials (e.g. a literal "\$6") so they are not mistaken
+    # for math delimiters and swallow the surrounding text.
+    for esc, ph in _ESC_PLACEHOLDERS:
+        tex = tex.replace(esc, ph)
     tex = re.sub(r"\$[^$]*\$", "", tex)
     tex = re.sub(r"\\\[.*?\\\]", "", tex, flags=re.DOTALL)
     tex = re.sub(r"\\\(.*?\\\)", "", tex, flags=re.DOTALL)
@@ -143,9 +157,9 @@ def clean_tex_for_sentence(tex: str) -> str:
     tex = strip_cmd_remove_content(tex, "citeauthor")
     tex = strip_cmd_remove_content(tex, "citeyear")
     tex = re.sub(r"\\(begin|end)\{[^}]*\}(\[[^\]]*\])?(\{[^}]*\})?", "", tex)
-    for esc, rep in [(r"\%", "%"), (r"\&", "&"), (r"\_", "_"),
-                     (r"\#", "#"), (r"\$", "$"), (r"~", " ")]:
-        tex = tex.replace(esc, rep)
+    tex = tex.replace("~", " ")
+    for (_, ph), rep in zip(_ESC_PLACEHOLDERS, ["$", "%", "&", "_", "#"]):
+        tex = tex.replace(ph, rep)
     tex = tex.replace("---", "—").replace("--", "–")
     tex = re.sub(r"\\\\", " ", tex)
     tex = re.sub(r"\s+", " ", tex)
@@ -699,8 +713,13 @@ def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dic
 
     all_keys = [k for rec in records for k in rec["keys"]]
     unique_keys = set(all_keys)
-    missing = sum(1 for k in unique_keys if k not in bib)
+    key_counts = Counter(all_keys)
+    missing_keys = sorted(k for k in unique_keys if k not in bib)
+    missing = len(missing_keys)
     dup_count = len(all_keys) - len(unique_keys)
+    repeated = sorted(((k, c) for k, c in key_counts.items() if c > 1),
+                      key=lambda kc: (-kc[1], kc[0]))
+    uncited = [k for k in bib if k not in unique_keys]
     word_count = meta.get("word_count", 0)
     char_count = meta.get("char_count", 0)
 
@@ -709,6 +728,7 @@ def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dic
         ["Unique references", str(len(unique_keys))],
         ["Duplicate citations", str(dup_count)],
         ["Missing bibliography entries", str(missing)],
+        ["Uncited references", str(len(uncited))],
         ["Number of claims extracted", str(len(records))],
         ["Total word count", f"{word_count:,}"],
         ["Total character count", f"{char_count:,}"],
@@ -752,6 +772,39 @@ def build_pdf(records: List[dict], bib: Dict[str, str], outpath: Path, meta: dic
             story.append(Paragraph(ref, styles["RefText"]))
         story.append(HRFlowable(width="100%", thickness=0.5, color=colors.Color(0.8, 0.8, 0.8)))
         story.append(Spacer(1, 0.2 * inch))
+
+    def add_diag_section(title, subtitle, rows):
+        """rows: list of (label_html, ref_text)."""
+        if not rows:
+            return
+        story.append(PageBreak())
+        story.append(Paragraph(title, styles["Heading2Color"]))
+        story.append(Paragraph(subtitle, styles["SectionLine"]))
+        for label, ref in rows:
+            story.append(Paragraph(label, styles["Heading3Color"]))
+            if ref:
+                story.append(Paragraph(ref, styles["RefText"]))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.Color(0.8, 0.8, 0.8)))
+        story.append(Spacer(1, 0.2 * inch))
+
+    add_diag_section(
+        f"Missing Bibliography Entries ({len(missing_keys)})",
+        "These keys are cited in the text but have no matching bibliography entry — broken references.",
+        [(f'<b>[{n}]</b> <font color="#b00020">{key}</font>', "")
+         for n, key in enumerate(missing_keys, 1)])
+
+    add_diag_section(
+        f"Repeated Citations ({len(repeated)})",
+        "References cited more than once, with the number of times each is cited.",
+        [(f'<b>[{n}]</b> <font color="#555555">{key}</font> '
+          f'&nbsp;&mdash;&nbsp;cited {c} times', bib.get(key, ""))
+         for n, (key, c) in enumerate(repeated, 1)])
+
+    add_diag_section(
+        f"Uncited References ({len(uncited)})",
+        "These entries appear in the bibliography but are never cited in the text.",
+        [(f'<b>[{n}]</b> <font color="#555555">{key}</font>', bib.get(key, ""))
+         for n, key in enumerate(uncited, 1)])
 
     def decorate_page(canvas, doc):
         canvas.saveState()
