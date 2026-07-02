@@ -187,7 +187,7 @@ Reading a paper's references is one of the most **inefficient** parts of researc
 Pass `--verify` and ClaimRef sends each **(claim, reference)** pair to Google **Gemini** and asks a single, focused question: *does this reference plausibly support this claim?* Each verdict is folded back into the report next to its citation.
 
 ```bash
-python3 citer.py paper.tex -o report.pdf --verify
+python3 ClaimRef.py paper.tex -o report.pdf --verify
 ```
 
 ```text
@@ -313,16 +313,16 @@ ClaimRef auto-detects the input type from the file extension.
 
 ```bash
 # LaTeX paper → report
-python3 citer.py paper.tex -o report.pdf
+python3 ClaimRef.py paper.tex -o report.pdf
 
 # PDF paper → report (numeric or author–year, auto-detected)
-python3 citer.py paper.pdf -o report.pdf
+python3 ClaimRef.py paper.pdf -o report.pdf
 
 # Add AI verification
-python3 citer.py paper.tex -o report.pdf --verify
+python3 ClaimRef.py paper.tex -o report.pdf --verify
 
 # Default output name (claims_report.pdf)
-python3 citer.py paper.tex
+python3 ClaimRef.py paper.tex
 ```
 
 <details>
@@ -331,7 +331,7 @@ python3 citer.py paper.tex
 <br/>
 
 ```
-usage: citer.py [-h] [-o OUTPUT] [--verify] source
+usage: ClaimRef.py [-h] [-o OUTPUT] [--verify] source
 
 positional arguments:
   source                Path to the paper: .tex (LaTeX) or .pdf
@@ -443,7 +443,7 @@ flowchart TB
 ```
 
 <details>
-<summary><b>Internal module map (inside <code>citer.py</code>)</b></summary>
+<summary><b>Internal module map</b></summary>
 
 <br/>
 
@@ -556,7 +556,7 @@ Reference managers **store** citations. ClaimRef **understands and audits** them
 
 ## Design Principles
 
-- **Single file, few dependencies** — `citer.py` is easy to read, audit, and vendor.
+- **Single file, few dependencies** — `ClaimRef.py` is easy to read, audit, and vendor.
 - **Deterministic core** — no ML in the base path; same input → same report. AI is strictly opt-in.
 - **One shared engine** — LaTeX and PDF converge on a single claim/audit/report renderer.
 - **Graceful degradation** — a missing `.bib`, no sections, an unknown style, or an absent API key each fail *loudly and locally*, never silently corrupting the output.
@@ -603,7 +603,7 @@ git clone https://github.com/<you>/claimref.git
 git checkout -b feature/amazing-idea
 
 # 3. Make changes, then verify on a sample paper
-python3 citer.py v10.tex -o report.pdf
+python3 ClaimRef.py v10.tex -o report.pdf
 
 # 4. Commit & open a PR
 git commit -m "feat: amazing idea"
